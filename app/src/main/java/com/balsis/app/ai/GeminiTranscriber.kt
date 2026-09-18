@@ -25,6 +25,14 @@ class GeminiTranscriber(private val apiKey: String) {
         .writeTimeout(60, TimeUnit.SECONDS)
         .build()
 
+    // Candidates in priority order
+    private val modelCandidates = listOf(
+        "gemini-2.0-flash",
+        "gemini-1.5-flash-latest",
+        "gemini-2.5-flash",
+        "gemini-1.5-flash"
+    )
+
     suspend fun transcribeAudio(
         audioBytes: ByteArray,
         mimeType: String = "audio/ogg"
@@ -33,36 +41,44 @@ class GeminiTranscriber(private val apiKey: String) {
             return@withContext Result.failure(IllegalStateException("Gemini API key is not configured."))
         }
 
-        try {
-            val base64Audio = Base64.encodeToString(audioBytes, Base64.NO_WRAP)
-            val jsonPayload = buildRequestPayload(base64Audio, mimeType)
+        val base64Audio = Base64.encodeToString(audioBytes, Base64.NO_WRAP)
+        val jsonPayload = buildRequestPayload(base64Audio, mimeType)
+        val body = jsonPayload.toString().toRequestBody("application/json; charset=utf-8".toMediaType())
 
-            // Using gemini-1.5-flash which has robust audio understanding and low latency
-            val url = "https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key=$apiKey"
+        var lastError: Exception? = null
 
-            val body = jsonPayload.toString().toRequestBody("application/json; charset=utf-8".toMediaType())
-            val request = Request.Builder()
-                .url(url)
-                .post(body)
-                .build()
+        for (model in modelCandidates) {
+            try {
+                val url = "https://generativelanguage.googleapis.com/v1beta/models/$model:generateContent?key=$apiKey"
+                val request = Request.Builder()
+                    .url(url)
+                    .post(body)
+                    .build()
 
-            val response = client.newCall(request).execute()
-            val responseBody = response.body?.string() ?: ""
+                val response = client.newCall(request).execute()
+                val responseBody = response.body?.string() ?: ""
 
-            if (!response.isSuccessful) {
-                val errorMsg = try {
-                    JSONObject(responseBody).getJSONObject("error").getString("message")
-                } catch (e: Exception) {
-                    "HTTP ${response.code}: $responseBody"
+                if (response.isSuccessful) {
+                    val result = parseGeminiResponse(responseBody)
+                    return@withContext Result.success(result)
+                } else {
+                    val errorMsg = try {
+                        JSONObject(responseBody).getJSONObject("error").getString("message")
+                    } catch (e: Exception) {
+                        "HTTP ${response.code}: $responseBody"
+                    }
+                    lastError = Exception(errorMsg)
+                    // If model not found (404), try next candidate
+                    if (response.code != 404 && !errorMsg.contains("not found", ignoreCase = true)) {
+                        break
+                    }
                 }
-                return@withContext Result.failure(Exception(errorMsg))
+            } catch (e: Exception) {
+                lastError = e
             }
-
-            val result = parseGeminiResponse(responseBody)
-            Result.success(result)
-        } catch (e: Exception) {
-            Result.failure(e)
         }
+
+        Result.failure(lastError ?: Exception("Neizdevās sazināties ar Gemini API."))
     }
 
     private fun buildRequestPayload(base64Audio: String, mimeType: String): JSONObject {
@@ -103,7 +119,7 @@ class GeminiTranscriber(private val apiKey: String) {
         contents.put(content)
         root.put("contents", contents)
 
-        // System Instruction / Generation Config
+        // Generation Config
         val genConfig = JSONObject().apply {
             put("temperature", 0.2)
             put("responseMimeType", "application/json")
@@ -140,7 +156,6 @@ class GeminiTranscriber(private val apiKey: String) {
                 detectedContext = parsedObj.optString("context", "")
             )
         } catch (e: Exception) {
-            // Fallback if model returned plain text instead of strictly valid JSON
             TranscriptionResult(
                 summary = "Kopsavilkums",
                 fullText = cleanJsonStr,
